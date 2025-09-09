@@ -1,0 +1,493 @@
+# app.py - Main Flask Application
+from flask import Flask, render_template, jsonify, request
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+import asyncio
+import threading
+import time
+import logging
+from datetime import datetime, timedelta
+import pytz
+import pandas as pd
+import numpy as np
+import talib
+from quotexapi.stable_api import Quotex
+from typing import Dict, List, Tuple, Optional
+import json
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Flask App Configuration
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///signal_analyst.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize extensions
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+# Timezone configuration
+UTC_PLUS_6 = pytz.timezone('Asia/Dhaka')
+
+# Database Models
+class Signal(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    asset = db.Column(db.String(50), nullable=False)
+    signal_type = db.Column(db.String(10), nullable=False)  # UP/DOWN
+    confidence = db.Column(db.Float, nullable=False)
+    strategy = db.Column(db.String(100), nullable=False)
+    execution_time = db.Column(db.DateTime, nullable=False)
+    trade_duration = db.Column(db.Integer, default=60)  # seconds
+    market_condition = db.Column(db.String(20), nullable=False)
+    current_price = db.Column(db.Float, nullable=False)
+    predicted_price = db.Column(db.Float)
+    support_level = db.Column(db.Float)
+    resistance_level = db.Column(db.Float)
+    rsi = db.Column(db.Float)
+    macd_signal = db.Column(db.String(10))
+    ma_signal = db.Column(db.String(10))
+    volume_signal = db.Column(db.String(10))
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    result = db.Column(db.String(10))  # WIN/LOSS/PENDING
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'asset': self.asset,
+            'signal_type': self.signal_type,
+            'confidence': round(self.confidence, 1),
+            'strategy': self.strategy,
+            'execution_time': self.execution_time.strftime('%H:%M:%S UTC+6'),
+            'execution_timestamp': self.execution_time.isoformat(),
+            'trade_duration': self.trade_duration,
+            'market_condition': self.market_condition,
+            'current_price': self.current_price,
+            'predicted_price': self.predicted_price,
+            'support_level': self.support_level,
+            'resistance_level': self.resistance_level,
+            'technical_indicators': {
+                'rsi': self.rsi,
+                'macd_signal': self.macd_signal,
+                'ma_signal': self.ma_signal,
+                'volume_signal': self.volume_signal
+            },
+            'is_active': self.is_active,
+            'result': self.result
+        }
+
+class SignalPerformance(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    total_signals = db.Column(db.Integer, default=0)
+    winning_signals = db.Column(db.Integer, default=0)
+    losing_signals = db.Column(db.Integer, default=0)
+    win_rate = db.Column(db.Float, default=0.0)
+    last_updated = db.Column(db.DateTime, default=datetime.utcnow)
+
+# Quotex Signal Analyzer
+class QuotexSignalAnalyzer:
+    def __init__(self):
+        self.client = None
+        self.is_connected = False
+        self.supported_assets = [
+            # Major Forex Pairs
+            "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "USDCHF_otc", "AUDUSD_otc",
+            "USDCAD_otc", "NZDUSD_otc", "EURJPY_otc", "GBPJPY_otc", "EURGBP_otc",
+            "EURAUD_otc", "EURCAD_otc", "GBPAUD_otc", "GBPCAD_otc", "AUDCAD_otc",
+            "AUDJPY_otc", "CADJPY_otc", "NZDJPY_otc", "CHFJPY_otc", "EURNZD_otc",
+            
+            # Minor Forex Pairs
+            "EURCHF_otc", "GBPCHF_otc", "AUDCHF_otc", "CADCHF_otc", "NZDCHF_otc",
+            "GBPNZD_otc", "AUDNZD_otc", "CADNZD_otc", "NZDCAD_otc",
+            
+            # Exotic Pairs
+            "USDSEK_otc", "USDNOK_otc", "USDDKK_otc", "USDPLN_otc", "USDCZK_otc",
+            "USDHUF_otc", "USDRON_otc", "USDRUB_otc", "USDTRY_otc", "USDZAR_otc",
+            "USDMXN_otc", "USDBRL_otc", "USDARS_otc", "USDCLP_otc", "USDCOP_otc",
+            
+            # Commodities
+            "XAUUSD_otc", "XAGUSD_otc", "XPTUSD_otc", "XPDUSD_otc",  # Metals
+            "USOIL_otc", "UKOIL_otc", "NGAS_otc",  # Energy
+            
+            # Crypto
+            "BTCUSD_otc", "ETHUSD_otc", "LTCUSD_otc", "XRPUSD_otc", "BCHUSD_otc",
+            "EOSUSD_otc", "ADAUSD_otc", "XLMUSD_otc", "TRXUSD_otc", "BNBUSD_otc",
+            "DOTUSD_otc", "UNIUSD_otc", "LINKUSD_otc", "SOLUSD_otc", "AVAXUSD_otc",
+            
+            # Stock Indices
+            "SPX500_otc", "NAS100_otc", "US30_otc", "GER40_otc", "UK100_otc",
+            "FRA40_otc", "AUS200_otc", "JPN225_otc", "ESP35_otc", "ITA40_otc",
+            
+            # Individual Stocks
+            "AAPL_otc", "GOOGL_otc", "MSFT_otc", "AMZN_otc", "TSLA_otc",
+            "META_otc", "NVDA_otc", "NFLX_otc", "BABA_otc", "AMD_otc"
+        ]
+        
+        self.min_confidence = 90.0  # Minimum confidence for signal generation
+        self.signal_cache = {}
+        
+    async def connect_to_quotex(self, email: str, password: str):
+        """Connect to Quotex API"""
+        try:
+            self.client = Quotex(email=email, password=password)
+            check, reason = await self.client.connect()
+            
+            if check:
+                self.is_connected = True
+                logger.info("Successfully connected to Quotex")
+                return True
+            else:
+                logger.error(f"Failed to connect to Quotex: {reason}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            return False
+    
+    def get_market_data(self, asset: str, timeframe: int = 60, count: int = 100) -> Optional[pd.DataFrame]:
+        """Get historical market data for analysis"""
+        try:
+            if not self.is_connected:
+                logger.error("Not connected to Quotex")
+                return None
+            
+            # Get candles data
+            end_time = time.time()
+            start_time = end_time - (count * timeframe)
+            
+            candles = self.client.get_candles(asset, timeframe, start_time, end_time)
+            
+            if not candles:
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(candles)
+            df['timestamp'] = pd.to_datetime(df['from'], unit='s')
+            df = df.rename(columns={
+                'open': 'open',
+                'high': 'high', 
+                'low': 'low',
+                'close': 'close',
+                'volume': 'volume'
+            })
+            
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            return df[-count:]  # Return last 'count' candles
+            
+        except Exception as e:
+            logger.error(f"Error getting market data for {asset}: {e}")
+            return None
+    
+    def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate comprehensive technical indicators"""
+        if df.empty or len(df) < 50:
+            return df
+            
+        try:
+            # Price arrays
+            high = df['high'].values
+            low = df['low'].values
+            close = df['close'].values
+            volume = df['volume'].values if 'volume' in df.columns else np.ones(len(df))
+            
+            # Moving Averages
+            df['sma_9'] = talib.SMA(close, timeperiod=9)
+            df['sma_21'] = talib.SMA(close, timeperiod=21)
+            df['sma_50'] = talib.SMA(close, timeperiod=50)
+            df['ema_9'] = talib.EMA(close, timeperiod=9)
+            df['ema_21'] = talib.EMA(close, timeperiod=21)
+            
+            # RSI
+            df['rsi'] = talib.RSI(close, timeperiod=14)
+            
+            # MACD
+            df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(close, 12, 26, 9)
+            
+            # Bollinger Bands
+            df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(close, timeperiod=20)
+            
+            # Stochastic
+            df['stoch_k'], df['stoch_d'] = talib.STOCH(high, low, close, 14, 3, 0, 3, 0)
+            
+            # Williams %R
+            df['williams_r'] = talib.WILLR(high, low, close, timeperiod=14)
+            
+            # ATR for volatility
+            df['atr'] = talib.ATR(high, low, close, timeperiod=14)
+            
+            # Volume indicators
+            df['obv'] = talib.OBV(close, volume)
+            
+            # Support and Resistance levels
+            df = self.calculate_support_resistance(df)
+            
+            # Zigzag and Fractals
+            df = self.calculate_fractals(df)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error calculating indicators: {e}")
+            return df
+    
+    def calculate_support_resistance(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate dynamic support and resistance levels"""
+        try:
+            if len(df) < 20:
+                return df
+            
+            # Calculate pivot points
+            high = df['high'].values
+            low = df['low'].values  
+            close = df['close'].values
+            
+            # Simple pivot calculation
+            pivot = (high + low + close) / 3
+            df['pivot'] = pivot
+            
+            # Support and resistance levels
+            df['resistance_1'] = 2 * pivot - low
+            df['support_1'] = 2 * pivot - high
+            df['resistance_2'] = pivot + (high - low)
+            df['support_2'] = pivot - (high - low)
+            
+            # Dynamic S/R based on recent highs/lows
+            window = 10
+            df['dynamic_resistance'] = df['high'].rolling(window=window).max()
+            df['dynamic_support'] = df['low'].rolling(window=window).min()
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error calculating S/R levels: {e}")
+            return df
+    
+    def calculate_fractals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate fractal patterns"""
+        try:
+            if len(df) < 5:
+                return df
+            
+            df['fractal_high'] = False
+            df['fractal_low'] = False
+            
+            for i in range(2, len(df) - 2):
+                # Fractal High: high[i] > high[i-2] and high[i] > high[i-1] and high[i] > high[i+1] and high[i] > high[i+2]
+                if (df.iloc[i]['high'] > df.iloc[i-2]['high'] and 
+                    df.iloc[i]['high'] > df.iloc[i-1]['high'] and
+                    df.iloc[i]['high'] > df.iloc[i+1]['high'] and 
+                    df.iloc[i]['high'] > df.iloc[i+2]['high']):
+                    df.iloc[i, df.columns.get_loc('fractal_high')] = True
+                
+                # Fractal Low: low[i] < low[i-2] and low[i] < low[i-1] and low[i] < low[i+1] and low[i] < low[i+2]
+                if (df.iloc[i]['low'] < df.iloc[i-2]['low'] and 
+                    df.iloc[i]['low'] < df.iloc[i-1]['low'] and
+                    df.iloc[i]['low'] < df.iloc[i+1]['low'] and 
+                    df.iloc[i]['low'] < df.iloc[i+2]['low']):
+                    df.iloc[i, df.columns.get_loc('fractal_low')] = True
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error calculating fractals: {e}")
+            return df
+    
+    def analyze_market_condition(self, df: pd.DataFrame) -> str:
+        """Analyze current market condition"""
+        if df.empty or len(df) < 20:
+            return "unknown"
+        
+        try:
+            latest = df.iloc[-1]
+            
+            # Volatility analysis using ATR
+            atr_ratio = latest['atr'] / df['atr'].rolling(window=20).mean().iloc[-1]
+            
+            # Price movement analysis
+            price_range = (latest['high'] - latest['low']) / latest['close']
+            avg_range = ((df['high'] - df['low']) / df['close']).rolling(window=20).mean().iloc[-1]
+            
+            # Volume analysis (if available)
+            volume_ratio = 1.0
+            if 'volume' in df.columns:
+                volume_ratio = latest['volume'] / df['volume'].rolling(window=20).mean().iloc[-1]
+            
+            # Determine market condition
+            if atr_ratio > 1.5 and price_range > avg_range * 1.3:
+                return "volatile"
+            elif atr_ratio < 0.7 and price_range < avg_range * 0.7:
+                return "stable"
+            elif (0.8 <= atr_ratio <= 1.2 and 
+                  0.8 <= price_range/avg_range <= 1.2 and
+                  0.8 <= volume_ratio <= 1.2):
+                return "perfect"
+            else:
+                return "stable"
+                
+        except Exception as e:
+            logger.error(f"Error analyzing market condition: {e}")
+            return "unknown"
+    
+    def generate_signal(self, asset: str) -> Optional[Dict]:
+        """Generate high-accuracy trading signal"""
+        try:
+            # Get market data
+            df = self.get_market_data(asset, timeframe=60, count=100)
+            if df is None or df.empty:
+                return None
+            
+            # Calculate technical indicators
+            df = self.calculate_technical_indicators(df)
+            if len(df) < 50:
+                return None
+            
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            # Initialize signal components
+            signal_strength = 0
+            signal_components = {}
+            
+            # 1. Support/Resistance Analysis (Primary - 40% weight)
+            sr_signal = self.analyze_support_resistance_signal(latest, prev)
+            signal_strength += sr_signal['strength'] * 0.4
+            signal_components['support_resistance'] = sr_signal
+            
+            # 2. RSI Confirmation (20% weight)
+            rsi_signal = self.analyze_rsi_signal(latest['rsi'], prev['rsi'])
+            signal_strength += rsi_signal['strength'] * 0.2
+            signal_components['rsi'] = rsi_signal
+            
+            # 3. MACD Confirmation (15% weight)
+            macd_signal = self.analyze_macd_signal(latest, prev)
+            signal_strength += macd_signal['strength'] * 0.15
+            signal_components['macd'] = macd_signal
+            
+            # 4. Moving Average Confirmation (10% weight)
+            ma_signal = self.analyze_ma_signal(latest)
+            signal_strength += ma_signal['strength'] * 0.1
+            signal_components['moving_averages'] = ma_signal
+            
+            # 5. Volume Analysis (10% weight)
+            volume_signal = self.analyze_volume_signal(df)
+            signal_strength += volume_signal['strength'] * 0.1
+            signal_components['volume'] = volume_signal
+            
+            # 6. Fractal and Price Action (5% weight)
+            fractal_signal = self.analyze_fractal_signal(df)
+            signal_strength += fractal_signal['strength'] * 0.05
+            signal_components['fractals'] = fractal_signal
+            
+            # Calculate final confidence
+            confidence = min(abs(signal_strength) * 20, 99.9)
+            
+            # Only return signals with high confidence
+            if confidence < self.min_confidence:
+                return None
+            
+            # Determine signal direction
+            signal_type = "UP" if signal_strength > 0 else "DOWN"
+            
+            # Get market condition
+            market_condition = self.analyze_market_condition(df)
+            
+            # Only proceed with perfect conditions
+            if market_condition not in ["perfect", "stable"]:
+                return None
+            
+            # Calculate execution time (next minute)
+            now_utc6 = datetime.now(UTC_PLUS_6)
+            execution_time = now_utc6.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            
+            # Build strategy description
+            strategy_parts = []
+            for component, signal in signal_components.items():
+                if abs(signal['strength']) > 0.5:
+                    strategy_parts.append(f"{component.replace('_', ' ').title()}")
+            
+            strategy = " + ".join(strategy_parts[:3])  # Top 3 components
+            
+            signal_data = {
+                'asset': asset,
+                'signal_type': signal_type,
+                'confidence': round(confidence, 1),
+                'strategy': strategy,
+                'execution_time': execution_time,
+                'trade_duration': 60,
+                'market_condition': market_condition,
+                'current_price': float(latest['close']),
+                'predicted_price': self.calculate_predicted_price(latest, signal_type),
+                'support_level': float(latest['support_1']),
+                'resistance_level': float(latest['resistance_1']),
+                'rsi': float(latest['rsi']),
+                'macd_signal': macd_signal['direction'],
+                'ma_signal': ma_signal['direction'],
+                'volume_signal': volume_signal['direction'],
+                'signal_components': signal_components
+            }
+            
+            return signal_data
+            
+        except Exception as e:
+            logger.error(f"Error generating signal for {asset}: {e}")
+            return None
+    
+    def analyze_support_resistance_signal(self, latest: pd.Series, prev: pd.Series) -> Dict:
+        """Analyze support/resistance levels for signal"""
+        try:
+            current_price = latest['close']
+            support = latest['support_1']
+            resistance = latest['resistance_1']
+            
+            # Distance from S/R levels
+            distance_to_support = (current_price - support) / current_price
+            distance_to_resistance = (resistance - current_price) / current_price
+            
+            strength = 0
+            direction = "neutral"
+            
+            # Strong signals near S/R levels
+            if distance_to_support < 0.002:  # Very close to support
+                strength = 2.5
+                direction = "up"
+            elif distance_to_resistance < 0.002:  # Very close to resistance  
+                strength = -2.5
+                direction = "down"
+            elif distance_to_support < 0.005:  # Close to support
+                strength = 1.5
+                direction = "up"
+            elif distance_to_resistance < 0.005:  # Close to resistance
+                strength = -1.5
+                direction = "down"
+            
+            # Check for bounces
+            if prev['close'] < support and current_price > support:
+                strength += 1.0  # Support bounce
+            elif prev['close'] > resistance and current_price < resistance:
+                strength -= 1.0  # Resistance rejection
+            
+            return {
+                'strength': strength,
+                'direction': direction,
+                'distance_to_support': round(distance_to_support * 100, 3),
+                'distance_to_resistance': round(distance_to_resistance * 100, 3)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing S/R signal: {e}")
+            return {'strength': 0, 'direction': 'neutral'}
+    
+    def analyze_rsi_signal(self, current_rsi: float, prev_rsi: float) -> Dict:
+        """Analyze RSI for confirmation"""
+        try:
+            strength = 0
+            direction = "neutral"
+            
+            # RSI extremes with divergence
+            if current_rsi <= 20:
+                strength = 2.0  # Oversold
+                direction = 
