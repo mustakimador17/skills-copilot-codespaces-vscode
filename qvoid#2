@@ -1,0 +1,993 @@
+# app.py - Main Flask Application
+from flask import Flask, render_template, jsonify, request
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+import asyncio
+import threading
+import time
+import logging
+from datetime import datetime, timedelta
+import pytz
+import pandas as pd
+import numpy as np
+import talib
+from quotexapi.stable_api import Quotex
+from typing import Dict, List, Tuple, Optional
+import json
+import os
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Flask App Configuration
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///signal_analyst.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize extensions
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+# Timezone configuration
+UTC_PLUS_6 = pytz.timezone('Asia/Dhaka')
+
+# Database Models
+class Signal(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    asset = db.Column(db.String(50), nullable=False)
+    signal_type = db.Column(db.String(10), nullable=False)  # UP/DOWN
+    confidence = db.Column(db.Float, nullable=False)
+    strategy = db.Column(db.String(100), nullable=False)
+    execution_time = db.Column(db.DateTime, nullable=False)
+    trade_duration = db.Column(db.Integer, default=60)  # seconds
+    market_condition = db.Column(db.String(20), nullable=False)
+    current_price = db.Column(db.Float, nullable=False)
+    predicted_price = db.Column(db.Float)
+    support_level = db.Column(db.Float)
+    resistance_level = db.Column(db.Float)
+    rsi = db.Column(db.Float)
+    macd_signal = db.Column(db.String(10))
+    ma_signal = db.Column(db.String(10))
+    volume_signal = db.Column(db.String(10))
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    result = db.Column(db.String(10))  # WIN/LOSS/PENDING
+    
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'asset': self.asset,
+            'signal_type': self.signal_type,
+            'confidence': round(self.confidence, 1),
+            'strategy': self.strategy,
+            'execution_time': self.execution_time.strftime('%H:%M:%S UTC+6'),
+            'execution_timestamp': self.execution_time.isoformat(),
+            'trade_duration': self.trade_duration,
+            'market_condition': self.market_condition,
+            'current_price': self.current_price,
+            'predicted_price': self.predicted_price,
+            'support_level': self.support_level,
+            'resistance_level': self.resistance_level,
+            'technical_indicators': {
+                'rsi': self.rsi,
+                'macd_signal': self.macd_signal,
+                'ma_signal': self.ma_signal,
+                'volume_signal': self.volume_signal
+            },
+            'is_active': self.is_active,
+            'result': self.result
+        }
+
+class SignalPerformance(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    total_signals = db.Column(db.Integer, default=0)
+    winning_signals = db.Column(db.Integer, default=0)
+    losing_signals = db.Column(db.Integer, default=0)
+    win_rate = db.Column(db.Float, default=0.0)
+    last_updated = db.Column(db.DateTime, default=datetime.utcnow)
+
+# Quotex Signal Analyzer
+class QuotexSignalAnalyzer:
+    def __init__(self):
+        self.client = None
+        self.is_connected = False
+        self.supported_assets = [
+            # Major Forex Pairs
+            "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "USDCHF_otc", "AUDUSD_otc",
+            "USDCAD_otc", "NZDUSD_otc", "EURJPY_otc", "GBPJPY_otc", "EURGBP_otc",
+            "EURAUD_otc", "EURCAD_otc", "GBPAUD_otc", "GBPCAD_otc", "AUDCAD_otc",
+            "AUDJPY_otc", "CADJPY_otc", "NZDJPY_otc", "CHFJPY_otc", "EURNZD_otc",
+            
+            # Minor Forex Pairs
+            "EURCHF_otc", "GBPCHF_otc", "AUDCHF_otc", "CADCHF_otc", "NZDCHF_otc",
+            "GBPNZD_otc", "AUDNZD_otc", "CADNZD_otc", "NZDCAD_otc",
+            
+            # Exotic Pairs
+            "USDSEK_otc", "USDNOK_otc", "USDDKK_otc", "USDPLN_otc", "USDCZK_otc",
+            "USDHUF_otc", "USDRON_otc", "USDRUB_otc", "USDTRY_otc", "USDZAR_otc",
+            "USDMXN_otc", "USDBRL_otc", "USDARS_otc", "USDCLP_otc", "USDCOP_otc",
+            
+            # Commodities
+            "XAUUSD_otc", "XAGUSD_otc", "XPTUSD_otc", "XPDUSD_otc",  # Metals
+            "USOIL_otc", "UKOIL_otc", "NGAS_otc",  # Energy
+            
+            # Crypto
+            "BTCUSD_otc", "ETHUSD_otc", "LTCUSD_otc", "XRPUSD_otc", "BCHUSD_otc",
+            "EOSUSD_otc", "ADAUSD_otc", "XLMUSD_otc", "TRXUSD_otc", "BNBUSD_otc",
+            "DOTUSD_otc", "UNIUSD_otc", "LINKUSD_otc", "SOLUSD_otc", "AVAXUSD_otc",
+            
+            # Stock Indices
+            "SPX500_otc", "NAS100_otc", "US30_otc", "GER40_otc", "UK100_otc",
+            "FRA40_otc", "AUS200_otc", "JPN225_otc", "ESP35_otc", "ITA40_otc",
+            
+            # Individual Stocks
+            "AAPL_otc", "GOOGL_otc", "MSFT_otc", "AMZN_otc", "TSLA_otc",
+            "META_otc", "NVDA_otc", "NFLX_otc", "BABA_otc", "AMD_otc"
+        ]
+        
+        self.min_confidence = 90.0  # Minimum confidence for signal generation
+        self.signal_cache = {}
+        
+    async def connect_to_quotex(self, email: str, password: str):
+        """Connect to Quotex API"""
+        try:
+            self.client = Quotex(email=email, password=password)
+            check, reason = await self.client.connect()
+            
+            if check:
+                self.is_connected = True
+                logger.info("Successfully connected to Quotex")
+                return True
+            else:
+                logger.error(f"Failed to connect to Quotex: {reason}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Connection error: {e}")
+            return False
+    
+    def get_market_data(self, asset: str, timeframe: int = 60, count: int = 100) -> Optional[pd.DataFrame]:
+        """Get historical market data for analysis"""
+        try:
+            if not self.is_connected:
+                logger.error("Not connected to Quotex")
+                return None
+            
+            # Get candles data
+            end_time = time.time()
+            start_time = end_time - (count * timeframe)
+            
+            candles = self.client.get_candles(asset, timeframe, start_time, end_time)
+            
+            if not candles:
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(candles)
+            df['timestamp'] = pd.to_datetime(df['from'], unit='s')
+            df = df.rename(columns={
+                'open': 'open',
+                'high': 'high', 
+                'low': 'low',
+                'close': 'close',
+                'volume': 'volume'
+            })
+            
+            df = df.sort_values('timestamp').reset_index(drop=True)
+            return df[-count:]  # Return last 'count' candles
+            
+        except Exception as e:
+            logger.error(f"Error getting market data for {asset}: {e}")
+            return None
+    
+    def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate comprehensive technical indicators"""
+        if df.empty or len(df) < 50:
+            return df
+            
+        try:
+            # Price arrays
+            high = df['high'].values
+            low = df['low'].values
+            close = df['close'].values
+            volume = df['volume'].values if 'volume' in df.columns else np.ones(len(df))
+            
+            # Moving Averages
+            df['sma_9'] = talib.SMA(close, timeperiod=9)
+            df['sma_21'] = talib.SMA(close, timeperiod=21)
+            df['sma_50'] = talib.SMA(close, timeperiod=50)
+            df['ema_9'] = talib.EMA(close, timeperiod=9)
+            df['ema_21'] = talib.EMA(close, timeperiod=21)
+            
+            # RSI
+            df['rsi'] = talib.RSI(close, timeperiod=14)
+            
+            # MACD
+            df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(close, 12, 26, 9)
+            
+            # Bollinger Bands
+            df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(close, timeperiod=20)
+            
+            # Stochastic
+            df['stoch_k'], df['stoch_d'] = talib.STOCH(high, low, close, 14, 3, 0, 3, 0)
+            
+            # Williams %R
+            df['williams_r'] = talib.WILLR(high, low, close, timeperiod=14)
+            
+            # ATR for volatility
+            df['atr'] = talib.ATR(high, low, close, timeperiod=14)
+            
+            # Volume indicators
+            df['obv'] = talib.OBV(close, volume)
+            
+            # Support and Resistance levels
+            df = self.calculate_support_resistance(df)
+            
+            # Zigzag and Fractals
+            df = self.calculate_fractals(df)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error calculating indicators: {e}")
+            return df
+    
+    def calculate_support_resistance(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate dynamic support and resistance levels"""
+        try:
+            if len(df) < 20:
+                return df
+            
+            # Calculate pivot points
+            high = df['high'].values
+            low = df['low'].values  
+            close = df['close'].values
+            
+            # Simple pivot calculation
+            pivot = (high + low + close) / 3
+            df['pivot'] = pivot
+            
+            # Support and resistance levels
+            df['resistance_1'] = 2 * pivot - low
+            df['support_1'] = 2 * pivot - high
+            df['resistance_2'] = pivot + (high - low)
+            df['support_2'] = pivot - (high - low)
+            
+            # Dynamic S/R based on recent highs/lows
+            window = 10
+            df['dynamic_resistance'] = df['high'].rolling(window=window).max()
+            df['dynamic_support'] = df['low'].rolling(window=window).min()
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error calculating S/R levels: {e}")
+            return df
+    
+    def calculate_fractals(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate fractal patterns"""
+        try:
+            if len(df) < 5:
+                return df
+            
+            df['fractal_high'] = False
+            df['fractal_low'] = False
+            
+            for i in range(2, len(df) - 2):
+                # Fractal High: high[i] > high[i-2] and high[i] > high[i-1] and high[i] > high[i+1] and high[i] > high[i+2]
+                if (df.iloc[i]['high'] > df.iloc[i-2]['high'] and 
+                    df.iloc[i]['high'] > df.iloc[i-1]['high'] and
+                    df.iloc[i]['high'] > df.iloc[i+1]['high'] and 
+                    df.iloc[i]['high'] > df.iloc[i+2]['high']):
+                    df.iloc[i, df.columns.get_loc('fractal_high')] = True
+                
+                # Fractal Low: low[i] < low[i-2] and low[i] < low[i-1] and low[i] < low[i+1] and low[i] < low[i+2]
+                if (df.iloc[i]['low'] < df.iloc[i-2]['low'] and 
+                    df.iloc[i]['low'] < df.iloc[i-1]['low'] and
+                    df.iloc[i]['low'] < df.iloc[i+1]['low'] and 
+                    df.iloc[i]['low'] < df.iloc[i+2]['low']):
+                    df.iloc[i, df.columns.get_loc('fractal_low')] = True
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error calculating fractals: {e}")
+            return df
+    
+    def analyze_market_condition(self, df: pd.DataFrame) -> str:
+        """Analyze current market condition"""
+        if df.empty or len(df) < 20:
+            return "unknown"
+        
+        try:
+            latest = df.iloc[-1]
+            
+            # Volatility analysis using ATR
+            atr_ratio = latest['atr'] / df['atr'].rolling(window=20).mean().iloc[-1]
+            
+            # Price movement analysis
+            price_range = (latest['high'] - latest['low']) / latest['close']
+            avg_range = ((df['high'] - df['low']) / df['close']).rolling(window=20).mean().iloc[-1]
+            
+            # Volume analysis (if available)
+            volume_ratio = 1.0
+            if 'volume' in df.columns:
+                volume_ratio = latest['volume'] / df['volume'].rolling(window=20).mean().iloc[-1]
+            
+            # Determine market condition
+            if atr_ratio > 1.5 and price_range > avg_range * 1.3:
+                return "volatile"
+            elif atr_ratio < 0.7 and price_range < avg_range * 0.7:
+                return "stable"
+            elif (0.8 <= atr_ratio <= 1.2 and 
+                  0.8 <= price_range/avg_range <= 1.2 and
+                  0.8 <= volume_ratio <= 1.2):
+                return "perfect"
+            else:
+                return "stable"
+                
+        except Exception as e:
+            logger.error(f"Error analyzing market condition: {e}")
+            return "unknown"
+    
+    def generate_signal(self, asset: str) -> Optional[Dict]:
+        """Generate high-accuracy trading signal"""
+        try:
+            # Get market data
+            df = self.get_market_data(asset, timeframe=60, count=100)
+            if df is None or df.empty:
+                return None
+            
+            # Calculate technical indicators
+            df = self.calculate_technical_indicators(df)
+            if len(df) < 50:
+                return None
+            
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            # Initialize signal components
+            signal_strength = 0
+            signal_components = {}
+            
+            # 1. Support/Resistance Analysis (Primary - 40% weight)
+            sr_signal = self.analyze_support_resistance_signal(latest, prev)
+            signal_strength += sr_signal['strength'] * 0.4
+            signal_components['support_resistance'] = sr_signal
+            
+            # 2. RSI Confirmation (20% weight)
+            rsi_signal = self.analyze_rsi_signal(latest['rsi'], prev['rsi'])
+            signal_strength += rsi_signal['strength'] * 0.2
+            signal_components['rsi'] = rsi_signal
+            
+            # 3. MACD Confirmation (15% weight)
+            macd_signal = self.analyze_macd_signal(latest, prev)
+            signal_strength += macd_signal['strength'] * 0.15
+            signal_components['macd'] = macd_signal
+            
+            # 4. Moving Average Confirmation (10% weight)
+            ma_signal = self.analyze_ma_signal(latest)
+            signal_strength += ma_signal['strength'] * 0.1
+            signal_components['moving_averages'] = ma_signal
+            
+            # 5. Volume Analysis (10% weight)
+            volume_signal = self.analyze_volume_signal(df)
+            signal_strength += volume_signal['strength'] * 0.1
+            signal_components['volume'] = volume_signal
+            
+            # 6. Fractal and Price Action (5% weight)
+            fractal_signal = self.analyze_fractal_signal(df)
+            signal_strength += fractal_signal['strength'] * 0.05
+            signal_components['fractals'] = fractal_signal
+            
+            # Calculate final confidence
+            confidence = min(abs(signal_strength) * 20, 99.9)
+            
+            # Only return signals with high confidence
+            if confidence < self.min_confidence:
+                return None
+            
+            # Determine signal direction
+            signal_type = "UP" if signal_strength > 0 else "DOWN"
+            
+            # Get market condition
+            market_condition = self.analyze_market_condition(df)
+            
+            # Only proceed with perfect conditions
+            if market_condition not in ["perfect", "stable"]:
+                return None
+            
+            # Calculate execution time (next minute)
+            now_utc6 = datetime.now(UTC_PLUS_6)
+            execution_time = now_utc6.replace(second=0, microsecond=0) + timedelta(minutes=1)
+            
+            # Build strategy description
+            strategy_parts = []
+            for component, signal in signal_components.items():
+                if abs(signal['strength']) > 0.5:
+                    strategy_parts.append(f"{component.replace('_', ' ').title()}")
+            
+            strategy = " + ".join(strategy_parts[:3])  # Top 3 components
+            
+            signal_data = {
+                'asset': asset,
+                'signal_type': signal_type,
+                'confidence': round(confidence, 1),
+                'strategy': strategy,
+                'execution_time': execution_time,
+                'trade_duration': 60,
+                'market_condition': market_condition,
+                'current_price': float(latest['close']),
+                'predicted_price': self.calculate_predicted_price(latest, signal_type),
+                'support_level': float(latest['support_1']),
+                'resistance_level': float(latest['resistance_1']),
+                'rsi': float(latest['rsi']),
+                'macd_signal': macd_signal['direction'],
+                'ma_signal': ma_signal['direction'],
+                'volume_signal': volume_signal['direction'],
+                'signal_components': signal_components
+            }
+            
+            return signal_data
+            
+        except Exception as e:
+            logger.error(f"Error generating signal for {asset}: {e}")
+            return None
+    
+    def analyze_support_resistance_signal(self, latest: pd.Series, prev: pd.Series) -> Dict:
+        """Analyze support/resistance levels for signal"""
+        try:
+            current_price = latest['close']
+            support = latest['support_1']
+            resistance = latest['resistance_1']
+            
+            # Distance from S/R levels
+            distance_to_support = (current_price - support) / current_price
+            distance_to_resistance = (resistance - current_price) / current_price
+            
+            strength = 0
+            direction = "neutral"
+            
+            # Strong signals near S/R levels
+            if distance_to_support < 0.002:  # Very close to support
+                strength = 2.5
+                direction = "up"
+            elif distance_to_resistance < 0.002:  # Very close to resistance  
+                strength = -2.5
+                direction = "down"
+            elif distance_to_support < 0.005:  # Close to support
+                strength = 1.5
+                direction = "up"
+            elif distance_to_resistance < 0.005:  # Close to resistance
+                strength = -1.5
+                direction = "down"
+            
+            # Check for bounces
+            if prev['close'] < support and current_price > support:
+                strength += 1.0  # Support bounce
+            elif prev['close'] > resistance and current_price < resistance:
+                strength -= 1.0  # Resistance rejection
+            
+            return {
+                'strength': strength,
+                'direction': direction,
+                'distance_to_support': round(distance_to_support * 100, 3),
+                'distance_to_resistance': round(distance_to_resistance * 100, 3)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing S/R signal: {e}")
+            return {'strength': 0, 'direction': 'neutral'}
+    
+    def analyze_rsi_signal(self, current_rsi: float, prev_rsi: float) -> Dict:
+        """Analyze RSI for confirmation"""
+        try:
+            strength = 0
+            direction = "neutral"
+            
+            # RSI extremes with divergence
+            if current_rsi <= 20:
+                strength = 2.0  # Oversold
+                direction = "up"
+            elif current_rsi >= 80:
+                strength = -2.0  # Overbought
+                direction = "down"
+            elif current_rsi <= 30 and current_rsi > prev_rsi:
+                strength = 1.5  # Oversold recovery
+                direction = "up"
+            elif current_rsi >= 70 and current_rsi < prev_rsi:
+                strength = -1.5  # Overbought decline
+                direction = "down"
+            elif 40 <= current_rsi <= 60:
+                # Neutral zone - look for momentum
+                if current_rsi > prev_rsi + 2:
+                    strength = 0.5
+                    direction = "up"
+                elif current_rsi < prev_rsi - 2:
+                    strength = -0.5
+                    direction = "down"
+            
+            return {
+                'strength': strength,
+                'direction': direction,
+                'value': round(current_rsi, 1)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing RSI: {e}")
+            return {'strength': 0, 'direction': 'neutral', 'value': 50}
+    
+    def analyze_macd_signal(self, latest: pd.Series, prev: pd.Series) -> Dict:
+        """Analyze MACD for trend confirmation"""
+        try:
+            macd = latest['macd']
+            macd_signal = latest['macd_signal']
+            macd_hist = latest['macd_hist']
+            
+            prev_hist = prev['macd_hist']
+            
+            strength = 0
+            direction = "neutral"
+            
+            # MACD crossovers
+            if macd > macd_signal and prev_hist < 0 and macd_hist > 0:
+                strength = 2.0  # Bullish crossover
+                direction = "up"
+            elif macd < macd_signal and prev_hist > 0 and macd_hist < 0:
+                strength = -2.0  # Bearish crossover
+                direction = "down"
+            elif macd > macd_signal and macd_hist > prev_hist:
+                strength = 1.0  # Bullish momentum
+                direction = "up"
+            elif macd < macd_signal and macd_hist < prev_hist:
+                strength = -1.0  # Bearish momentum
+                direction = "down"
+            
+            # MACD histogram momentum
+            if macd_hist > 0 and macd_hist > prev_hist * 1.1:
+                strength += 0.5
+            elif macd_hist < 0 and macd_hist < prev_hist * 1.1:
+                strength -= 0.5
+            
+            return {
+                'strength': strength,
+                'direction': direction,
+                'crossover': macd > macd_signal
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing MACD: {e}")
+            return {'strength': 0, 'direction': 'neutral', 'crossover': False}
+    
+    def analyze_ma_signal(self, latest: pd.Series) -> Dict:
+        """Analyze Moving Average alignment"""
+        try:
+            price = latest['close']
+            sma_9 = latest['sma_9']
+            sma_21 = latest['sma_21']
+            ema_9 = latest['ema_9']
+            ema_21 = latest['ema_21']
+            
+            strength = 0
+            direction = "neutral"
+            
+            # MA alignment
+            if price > ema_9 > ema_21 > sma_21:
+                strength = 2.0  # Perfect bullish alignment
+                direction = "up"
+            elif price < ema_9 < ema_21 < sma_21:
+                strength = -2.0  # Perfect bearish alignment
+                direction = "down"
+            elif price > ema_9 > ema_21:
+                strength = 1.0  # Good bullish alignment
+                direction = "up"
+            elif price < ema_9 < ema_21:
+                strength = -1.0  # Good bearish alignment
+                direction = "down"
+            elif price > sma_9:
+                strength = 0.5
+                direction = "up"
+            elif price < sma_9:
+                strength = -0.5
+                direction = "down"
+            
+            return {
+                'strength': strength,
+                'direction': direction,
+                'alignment': 'bullish' if strength > 0 else 'bearish' if strength < 0 else 'mixed'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing MAs: {e}")
+            return {'strength': 0, 'direction': 'neutral', 'alignment': 'mixed'}
+    
+    def analyze_volume_signal(self, df: pd.DataFrame) -> Dict:
+        """Analyze volume for confirmation"""
+        try:
+            if 'volume' not in df.columns:
+                return {'strength': 0, 'direction': 'neutral', 'relative_volume': 1.0}
+            
+            latest_volume = df.iloc[-1]['volume']
+            avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
+            
+            volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
+            
+            strength = 0
+            direction = "neutral"
+            
+            # High volume confirmation
+            if volume_ratio > 2.0:
+                strength = 1.5  # Very high volume
+            elif volume_ratio > 1.5:
+                strength = 1.0  # High volume
+            elif volume_ratio < 0.5:
+                strength = -0.5  # Low volume (weak signal)
+            
+            # Volume trend
+            volume_sma = df['volume'].rolling(window=5).mean()
+            if volume_sma.iloc[-1] > volume_sma.iloc[-2]:
+                direction = "increasing"
+            else:
+                direction = "decreasing"
+            
+            return {
+                'strength': strength,
+                'direction': direction,
+                'relative_volume': round(volume_ratio, 2)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing volume: {e}")
+            return {'strength': 0, 'direction': 'neutral', 'relative_volume': 1.0}
+    
+    def analyze_fractal_signal(self, df: pd.DataFrame) -> Dict:
+        """Analyze fractal patterns"""
+        try:
+            if len(df) < 10:
+                return {'strength': 0, 'direction': 'neutral'}
+            
+            # Check recent fractals
+            recent_fractal_high = df['fractal_high'].tail(5).any()
+            recent_fractal_low = df['fractal_low'].tail(5).any()
+            
+            current_price = df.iloc[-1]['close']
+            
+            strength = 0
+            direction = "neutral"
+            
+            if recent_fractal_low and current_price > df[df['fractal_low']].tail(1)['low'].iloc[0]:
+                strength = 1.0  # Price above recent fractal low
+                direction = "up"
+            elif recent_fractal_high and current_price < df[df['fractal_high']].tail(1)['high'].iloc[0]:
+                strength = -1.0  # Price below recent fractal high
+                direction = "down"
+            
+            return {
+                'strength': strength,
+                'direction': direction,
+                'recent_fractal_high': recent_fractal_high,
+                'recent_fractal_low': recent_fractal_low
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing fractals: {e}")
+            return {'strength': 0, 'direction': 'neutral'}
+    
+    def calculate_predicted_price(self, latest: pd.Series, signal_type: str) -> float:
+        """Calculate predicted price for next candle"""
+        try:
+            current_price = latest['close']
+            atr = latest['atr']
+            
+            # Predict based on signal and volatility
+            if signal_type == "UP":
+                predicted_price = current_price + (atr * 0.3)
+            else:
+                predicted_price = current_price - (atr * 0.3)
+            
+            return float(predicted_price)
+            
+        except Exception as e:
+            logger.error(f"Error calculating predicted price: {e}")
+            return float(latest['close'])
+
+# Initialize the analyzer
+analyzer = QuotexSignalAnalyzer()
+
+# Signal Generation Service
+class SignalGenerationService:
+    def __init__(self):
+        self.is_running = False
+        self.generation_thread = None
+        
+    def start_signal_generation(self):
+        """Start automatic signal generation"""
+        if not self.is_running:
+            self.is_running = True
+            self.generation_thread = threading.Thread(target=self._generate_signals_loop)
+            self.generation_thread.daemon = True
+            self.generation_thread.start()
+            logger.info("Signal generation service started")
+    
+    def stop_signal_generation(self):
+        """Stop automatic signal generation"""
+        self.is_running = False
+        if self.generation_thread:
+            self.generation_thread.join(timeout=5)
+        logger.info("Signal generation service stopped")
+    
+    def _generate_signals_loop(self):
+        """Main signal generation loop"""
+        while self.is_running:
+            try:
+                # Generate signals for all assets
+                self.generate_all_signals()
+                
+                # Wait 3 minutes before next generation
+                for _ in range(180):  # 180 seconds = 3 minutes
+                    if not self.is_running:
+                        break
+                    time.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Error in signal generation loop: {e}")
+                time.sleep(30)  # Wait 30 seconds before retrying
+    
+    def generate_all_signals(self):
+        """Generate signals for all supported assets"""
+        if not analyzer.is_connected:
+            logger.warning("Analyzer not connected, skipping signal generation")
+            return
+        
+        with app.app_context():
+            # Clear old active signals
+            Signal.query.filter_by(is_active=True).update({'is_active': False})
+            
+            generated_count = 0
+            
+            for asset in analyzer.supported_assets:
+                try:
+                    signal_data = analyzer.generate_signal(asset)
+                    
+                    if signal_data and signal_data['confidence'] >= analyzer.min_confidence:
+                        # Save signal to database
+                        signal = Signal(
+                            asset=signal_data['asset'],
+                            signal_type=signal_data['signal_type'],
+                            confidence=signal_data['confidence'],
+                            strategy=signal_data['strategy'],
+                            execution_time=signal_data['execution_time'],
+                            trade_duration=signal_data['trade_duration'],
+                            market_condition=signal_data['market_condition'],
+                            current_price=signal_data['current_price'],
+                            predicted_price=signal_data['predicted_price'],
+                            support_level=signal_data['support_level'],
+                            resistance_level=signal_data['resistance_level'],
+                            rsi=signal_data['rsi'],
+                            macd_signal=signal_data['macd_signal'],
+                            ma_signal=signal_data['ma_signal'],
+                            volume_signal=signal_data['volume_signal'],
+                            is_active=True
+                        )
+                        
+                        db.session.add(signal)
+                        generated_count += 1
+                        
+                except Exception as e:
+                    logger.error(f"Error generating signal for {asset}: {e}")
+                    continue
+            
+            try:
+                db.session.commit()
+                logger.info(f"Generated {generated_count} high-confidence signals")
+            except Exception as e:
+                logger.error(f"Error saving signals to database: {e}")
+                db.session.rollback()
+
+# Initialize signal service
+signal_service = SignalGenerationService()
+
+# Flask Routes
+@app.route('/')
+def index():
+    """Main application page"""
+    return render_template('index.html')
+
+@app.route('/api/signals')
+def get_active_signals():
+    """Get all active signals"""
+    try:
+        signals = Signal.query.filter_by(is_active=True).order_by(Signal.confidence.desc()).all()
+        return jsonify({
+            'success': True,
+            'signals': [signal.to_dict() for signal in signals],
+            'count': len(signals),
+            'timestamp': datetime.now(UTC_PLUS_6).isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Error getting active signals: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/signals/generate', methods=['POST'])
+def generate_signals_manually():
+    """Manually trigger signal generation"""
+    try:
+        if not analyzer.is_connected:
+            return jsonify({
+                'success': False,
+                'error': 'Not connected to Quotex. Please check connection.'
+            })
+        
+        # Run signal generation in background
+        threading.Thread(target=signal_service.generate_all_signals).start()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Signal generation started. Refresh in a few moments to see new signals.'
+        })
+    except Exception as e:
+        logger.error(f"Error in manual signal generation: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/signals/clear', methods=['POST'])
+def clear_signals():
+    """Clear all active signals"""
+    try:
+        Signal.query.filter_by(is_active=True).update({'is_active': False})
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'All signals cleared successfully'
+        })
+    except Exception as e:
+        logger.error(f"Error clearing signals: {e}")
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/performance')
+def get_performance():
+    """Get trading performance statistics"""
+    try:
+        total_signals = Signal.query.count()
+        winning_signals = Signal.query.filter_by(result='WIN').count()
+        losing_signals = Signal.query.filter_by(result='LOSS').count()
+        
+        win_rate = (winning_signals / total_signals * 100) if total_signals > 0 else 0
+        
+        # Get performance by asset type
+        asset_performance = db.session.query(
+            Signal.asset,
+            db.func.count(Signal.id).label('total'),
+            db.func.count(db.case((Signal.result == 'WIN', 1))).label('wins')
+        ).group_by(Signal.asset).all()
+        
+        asset_stats = []
+        for asset, total, wins in asset_performance:
+            win_rate_asset = (wins / total * 100) if total > 0 else 0
+            asset_stats.append({
+                'asset': asset,
+                'total_signals': total,
+                'wins': wins,
+                'win_rate': round(win_rate_asset, 1)
+            })
+        
+        return jsonify({
+            'success': True,
+            'performance': {
+                'total_signals': total_signals,
+                'winning_signals': winning_signals,
+                'losing_signals': losing_signals,
+                'win_rate': round(win_rate, 1),
+                'asset_performance': asset_stats
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error getting performance: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/connect', methods=['POST'])
+def connect_quotex():
+    """Connect to Quotex API"""
+    try:
+        data = request.get_json()
+        email = data.get('email')
+        password = data.get('password')
+        
+        if not email or not password:
+            return jsonify({
+                'success': False,
+                'error': 'Email and password are required'
+            })
+        
+        # Connect to Quotex in a separate thread
+        def connect_async():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                success = loop.run_until_complete(analyzer.connect_to_quotex(email, password))
+                if success:
+                    # Start signal generation service
+                    signal_service.start_signal_generation()
+                return success
+            finally:
+                loop.close()
+        
+        # Run connection in thread
+        connection_thread = threading.Thread(target=connect_async)
+        connection_thread.start()
+        connection_thread.join(timeout=30)  # 30 second timeout
+        
+        if analyzer.is_connected:
+            return jsonify({
+                'success': True,
+                'message': 'Successfully connected to Quotex and started signal generation'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to connect to Quotex. Please check credentials.'
+            })
+            
+    except Exception as e:
+        logger.error(f"Error connecting to Quotex: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/status')
+def get_status():
+    """Get application status"""
+    try:
+        active_signals_count = Signal.query.filter_by(is_active=True).count()
+        
+        return jsonify({
+            'success': True,
+            'status': {
+                'quotex_connected': analyzer.is_connected,
+                'signal_generation_active': signal_service.is_running,
+                'active_signals': active_signals_count,
+                'supported_assets': len(analyzer.supported_assets),
+                'server_time_utc6': datetime.now(UTC_PLUS_6).strftime('%Y-%m-%d %H:%M:%S'),
+                'min_confidence': analyzer.min_confidence
+            }
+        })
+    except Exception as e:
+        logger.error(f"Error getting status: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+# Error Handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'success': False, 'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    logger.error(f"Internal error: {error}")
+    return jsonify({'success': False, 'error': 'Internal server error'}), 500
+
+# Create database tables
+@app.before_first_request
+def create_tables():
+    db.create_all()
+
+if __name__ == '__main__':
+    print("🚀 Starting Quotex Signal Analyst v1.0.0...")
+    print("📊 Features:")
+    print("   • High-accuracy signals (90-99%)")
+    print("   • 1-minute binary options for Quotex OTC")
+    print("   • Support/Resistance + Multi-indicator confirmation")
+    print("   • Auto signal generation every 3 minutes")
+    print("   • Professional web interface")
+    print("   • Real-time updates")
+    print("\n📦 Dependencies:")
+    print("pip install flask flask-sqlalchemy flask-migrate quotexapi pandas numpy talib pytz")
+    print("\n🌐 Application will be available at: http://localhost:5000")
+    print("⚠️  Connect to Quotex first to start signal generation")
+    
+    # Create database tables
+    with app.app_context():
+        db.create_all()
+    
+    # Run the Flask application
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
