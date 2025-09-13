@@ -1,0 +1,11 @@
+Flask==2.2.5
+Flask-SocketIO==6.4.0
+eventlet==0.33.3
+opencv-python==4.7.0.72
+pytesseract==0.3.10
+numpy==1.26.5
+pandas==2.2.2
+pandas_ta==0.3.0b0
+scipy==1.11.3
+python-dateutil==2.8.2
+Pillow==10.1.0
