@@ -1,0 +1,25 @@
+/* static/css/styles.css - responsive & mobile-friendly */
+:root{
+  --bg:#f7fafc; --card:#fff; --muted:#6b7280; --accent:#2b6cb0;
+  --maxw:1080px;
+}
+*{box-sizing:border-box}
+body{font-family:Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin:0; background:var(--bg); color:#0f172a; line-height:1.4}
+.container{max-width:var(--maxw); margin:12px auto; padding:12px}
+header h1{margin:0 0 6px; font-size:20px}
+.muted{color:var(--muted); font-size:13px}
+.card{background:var(--card); border-radius:12px; padding:12px; box-shadow:0 1px 6px rgba(2,6,23,0.06); margin-bottom:12px}
+.upload-card input[type=file]{width:100%}
+.row{display:flex; gap:8px; margin-top:8px}
+.btn{padding:8px 12px; border-radius:8px; border:1px solid #e6eef8; background:white; cursor:pointer}
+.btn.primary{background:var(--accent); color:white; border:none}
+.feed-item{border-bottom:1px solid #eef2f7; padding:8px 6px; display:flex; justify-content:space-between; gap:10px; align-items:center}
+.feed-left{flex:1}
+.feed-right{min-width:120px; text-align:right}
+.badge{display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px}
+.badge.up{background:#e6ffef;color:#065f46}
+.badge.down{background:#fff0f0;color:#7f1d1d}
+@media (max-width:640px){
+  .row{flex-direction:column}
+  .feed-right{min-width:70px}
+}
