@@ -1,0 +1,52 @@
+<!-- templates/index.html -->
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>1m Signal Generator — Demo</title>
+  <link rel="stylesheet" href="/static/css/styles.css">
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>1-Minute Binary Signal Generator</h1>
+      <p class="muted">Upload a 1m candlestick chart screenshot. Server will parse & return a signal (UTC+6)</p>
+    </header>
+
+    <main>
+      <section class="card upload-card">
+        <label for="asset">Asset</label>
+        <select id="asset"></select>
+
+        <label for="file">Chart image</label>
+        <input id="file" type="file" accept="image/*">
+
+        <div class="row">
+          <button id="send" class="btn primary">Upload & Generate</button>
+          <button id="clear" class="btn">Clear feed</button>
+        </div>
+
+        <p id="status" class="muted">Tip: use consistent chart screenshots (same broker/theme) for best results.</p>
+      </section>
+
+      <section class="card feed-card">
+        <h2>Live Signals</h2>
+        <div id="feed" aria-live="polite"></div>
+      </section>
+
+      <section class="card guidance-card">
+        <h2>Asset Guidance</h2>
+        <div id="guidance"></div>
+      </section>
+    </main>
+
+    <footer>
+      <small>UTC+6 times shown. This tool is for research / demo only — do not trade live without validation.</small>
+    </footer>
+  </div>
+
+  <script src="/static/js/main.js"></script>
+</body>
+</html>
